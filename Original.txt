@@ -1,0 +1,147 @@
+-- Antenna tracker LUA script for EdgeTX
+-- Radio needs local GPS and Telemetry from airplane must contain GPS coordinates and height
+
+-- What it does:
+-- Gets local GPS coordinates from EdgeTx
+-- Gets remote GPS coordinates from telemetry variables
+-- Calculates azimuth and elevation to remote vehicle
+-- Maps azimuth and elevation to fit full range servo outputs
+-- Calculated values for servos are stored in GV1 and GV2
+
+-- How it is used:
+-- Copy LUA to SCRIPTS\FUNCTIONS\lutrack.lua 
+-- In EdgeTX, make two new Inputs and assign GV1 and GV2 to them
+-- In Mixer, assign those two Inputs to Outputs of your liking (I use CH17 and CH18)
+-- Set internal Multimodule to transmit channels from 17 to 18
+-- Plug servos to some old paired receiver (I use Spektrum DSM2)
+-- Set servo endpoints and direction in usual way
+-- Set tracker to true north
+-- Enable tracker LUA by Special Function and a swicth
+-- Profit!
+
+-- [c] kolin 2023
+
+-- some examples of LUA scripts:
+-- https://github.com/moschotto/OpenTX_GPS_Telemetry/blob/7282328f2fdf0f37f782cf187ad0725a0a162cfb/T16/GPS/main.lua#L236-L259
+-- https://github.com/moschotto/Taranis_X9/blob/master/GPS.lua    
+
+-- Global variables for this script
+local localGPS = {}
+local remoteGPS = {}
+
+
+function getAzElDist(localGPSlat, localGPSlon, localGPSalt, remoteGPSlat, remoteGPSlon, remoteGPSalt)
+    local d2r = math.pi / 180.0
+    local r2d = 180.0 / math.pi
+
+    local lat1 = localGPSlat * d2r
+    local lon1 = localGPSlon * d2r
+    local lat2 = remoteGPSlat * d2r
+    local lon2 = remoteGPSlon * d2r
+
+    local dLon = lon2 - lon1
+
+    local y = math.sin(dLon) * math.cos(lat2)
+    local x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dLon)
+
+    local azimuthRadians = math.atan2(y, x)
+    local azimuthDegrees = (azimuthRadians * r2d + 360) % 360
+
+    -- Earth radius in meters
+    local R = 6371000
+
+    -- Distance between the two GPS points in meters
+    local dLat = lat2 - lat1
+    local dLon = lon2 - lon1
+
+    -- Haversine formula to calculate distance between two GPS points
+    local a = (math.sin(dLat / 2)) ^ 2 + math.cos(lat1) * math.cos(lat2) * (math.sin(dLon / 2)) ^ 2
+    local c = 2 * math.atan(math.sqrt(a), math.sqrt(1 - a))
+    local distanceInMeters = R * c
+
+    -- Elevation calculation using Pythagoras theorem
+    -- Height difference between the two GPS points in meters
+    local heightDifferenceInMeters = remoteGPSalt - localGPSalt
+
+    -- Elevation angle calculation in radians using Pythagoras theorem
+    -- tan(elevation angle) = height difference / distance between the two GPS points
+    -- elevation angle in degrees is atan(tan(elevation angle))
+    elevationAngleInRadians = math.atan(heightDifferenceInMeters / distanceInMeters)
+    elevationAngleInDegrees = elevationAngleInRadians * (180.0 / math.pi)
+
+    return azimuthDegrees, elevationAngleInDegrees, distanceInMeters
+end
+
+function map_range(value, in_min, in_max, out_min, out_max)
+    return (value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+  end
+
+
+-- function called once by opentx
+local function init_func()
+    -- your code here
+    print("Antenna tracker in LUA started")
+    print("LUtrack v0.0")
+end
+
+local function getTelemetryId(name)
+    field = getFieldInfo(name)
+    if field then
+      return field.id
+    else
+      return -1
+    end
+end
+
+--function called periodically
+local function run_func()
+    --get position data from the radio-------------------------------------------------------------------------------------------------------------------
+    --local localGPS.lat = getTxGPS().lat
+    --local localGPS.lon =getTxGPS().lon
+    --local localGPS.alt = getTxGPS().alt   
+    localGPS.lat = 50.0505267  --sim does not provide radio pos, so static value for now :-/
+    localGPS.lon = 14.2113011  --sim does not provide radio pos, so static value for now :-/
+    localGPS.alt = 400         --sim does not provide radio pos, so static value for now :-/
+    
+    --get position data from remote vehicle ------------------------------------------------------------------------------------------------------------    
+    local telemetryGpsID = getTelemetryId("GPS")    --find what ID has GPS telemetry slot been assigned
+    local remoteGPStable = getValue(telemetryGpsID) --read value of ID
+    
+    if type(remoteGPStable) == "table" then -- sanity check
+        remoteGPS.lat = remoteGPStable.lat
+        remoteGPS.lon = remoteGPStable.lon
+    else
+        print("ERROR: GPS data cannot not found in telemetry variables")
+    end
+    
+    local telemetryAltID = getTelemetryId("Alt")
+    if telemetryAltID ~= -1 then
+        remoteGPS.alt = getValue(telemetryAltID)
+    else
+        print("ERROR: Altitude data cannot not found in telemetry variables")
+    end
+        
+    --plug position data to AzEl function to get the azimuth, elevation and distance-----------------------------------------------------------------------
+    azimuth, elevation, distance = getAzElDist(localGPS.lat, localGPS.lon, localGPS.alt, remoteGPS.lat, remoteGPS.lon, remoteGPS.alt)
+    
+    --map values of azimuth 0-360 to -1024 to 1024 and elevation 0-90 to -1024 to 1024---------------------------------------------------------------------
+    if elevation < 0 then -- Tilt servo on tracker cannot look down, so negative elevation limit would be 0deg
+        elevation = 0
+    end
+    local azimuthMapped   = math.floor(map_range(azimuth,   0, 360, -1024, 1024))   --map range of degrees to match range for servo
+    local elevationMapped = math.floor(map_range(elevation, 0,  90, -1024, 1024))
+    
+    --output mapped values to GVARs -----------------------------------------------------------------------------------------------------------------------
+    model.setGlobalVariable(0, 0, azimuthMapped)    -- model.setGlobalVariable(index, flight_mode, value), use 0 for GV1, 8 for GV9
+    model.setGlobalVariable(1, 0, elevationMapped)
+
+    --debug output ---------------------------------------------------------------------------------------------------------------------------------------
+    print("-----------------------------------------------------------------------------------------------------------")
+    print(string.format("Local  GPS latitude: %-20s Local GPS longitude: %-20s Local altitude: %s", localGPS.lat, localGPS.lon, localGPS.alt))
+    print(string.format("Remote GPS latitude: %-19s Remote GPS longitude: %-19s Remote altitude: %s", remoteGPS.lat, remoteGPS.lon, remoteGPS.alt))
+    print(string.format("Azimuth: %-42s Elevation: %-20s Distance : %s", azimuth, elevation, distance))
+    print("Azimuth mapped to servo range: " .. azimuthMapped .. "  Elevation mapped to servo range " .. elevationMapped)
+    --print("GPS telemetry ID: " .. telemetryGpsID .. "    Alt telemetry ID: " .. telemetryAltID)
+end
+
+return {run = run_func, init = init_func}
